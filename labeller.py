@@ -23,8 +23,8 @@ class Labeller(object):
     def build_netowrk(self):
         # placeholders
         self.word_ids = tf.placeholder(tf.int32, [None, None], name="word_ids")
+        self.label_ids = tf.placeholder(tf.int32, [None, None], name="label_ids")
         self.sent_lengths = tf.placeholder(tf.int32, [None], name="sent_lengths")
-        self.labels = tf.placeholder(tf.int32, [None, None], name="labels")
 
         # embeddings
         word_embedded = embedding(self.word_ids, self.vocab_size, self.num_units)
@@ -41,7 +41,43 @@ class Labeller(object):
                 inputs = self_attention_layer(inputs, 512, 8, 0.1, True, scope_name)
 
         scope_name = "self_attn" + str(self.num_stacks-1)
-        self.outputs = self_attention_layer(inputs, 512, 8, 0.1, True, scope_name)
+        self_attn_outputs = self_attention_layer(inputs, 512, 8, 0.1, True, scope_name) # shape = [batch_size, max_sentence_length, num_units]
+
+
+        # ---------- linear & softmax --------- #
+        with tf.variable_scope("linear_projection", reuse=None):
+            w1 = tf.get_variable("w1", shape=[512, 100], initializer=tf.glorot_normal_initializer())
+            b1 = tf.get_variable("b1", shape=[1, 100], initializer=tf.zeros_initializer())
+            w2 = tf.get_variable("w2", shape=[100, 2], initializer=tf.glorot_normal_initializer())
+            b2 = tf.get_variable("b2", shape=[1, 2], initializer=tf.zeros_initializer())
+
+        x0 = tf.reshape(self_attn_outputs, shape=[self.batch_size*self.max_sentence_length, 512])
+        a1 = tf.nn.relu(tf.matmul(x0, w1) + b1)
+        logits = tf.matmul(a1, w2) + b2
+
+        logits = tf.reshape(logits, shape=[self.batch_size, self.max_sentence_length, 2])
+
+        self.probabilities = tf.nn.softmax(logits)
+        self.predictions = tf.argmax(self.probabilities, 2)
+
+        # ----------- cost function ----------- #
+        crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=self.label_ids)
+        target_weights = tf.sequence_mask(lengths=self.sent_lengths,
+                                            maxlen=self.max_sentence_length,
+                                            dtype=tf.float32)
+
+        self.loss = tf.reduce_sum(crossent * target_weights) / self.batch_size
+
+
+        # ----- Gradient and Optimisation ----- #
+        trainable_params = tf.trainable_variables() # return a list of Variable objects
+        gradients = tf.gradients(self.loss, trainable_params)
+        max_gradient_norm = 1.0 # set to value like 1.0, 5.0
+        clipped_gradients, _ = tf.clip_by_global_norm(gradients, max_gradient_norm)
+
+        # optimisation
+        self.optimizer = tf.train.AdamOptimizer(self.learning_rate)
+        self.train_op = self.optimizer.apply_gradients(zip(clipped_gradients, trainable_params))
 
 
         print("build neural network model successful")
@@ -72,8 +108,8 @@ def layer_norm(inputs, epsilon=1e-8, scope="layer_norm", reuse=None):
         params_shape = inputs_shape[-1:]
 
         mean, variance = tf.nn.moments(inputs, [-1], keep_dims=True)
-        beta= tf.Variable(tf.zeros(params_shape))
-        gamma = tf.Variable(tf.ones(params_shape))
+        beta= tf.Variable(tf.zeros(params_shape), name="beta")
+        gamma = tf.Variable(tf.ones(params_shape), name="gamma")
         normalized = (inputs - mean) / ( (variance + epsilon) ** (.5) )
         outputs = gamma * normalized + beta
 
@@ -149,9 +185,9 @@ def multihead_attention(query, key, value,
             num_units = query.get_shape().as_list()[-1]
 
         # linear projections --- output dimension [N, timestep, C]
-        Q = tf.layers.dense(query, num_units, activation=tf.nn.relu)
-        K = tf.layers.dense(key, num_units, activation=tf.nn.relu)
-        V = tf.layers.dense(value, num_units, activation=tf.nn.relu)
+        Q = tf.layers.dense(query, num_units, activation=tf.nn.relu, name="query")
+        K = tf.layers.dense(key, num_units, activation=tf.nn.relu, name="key")
+        V = tf.layers.dense(value, num_units, activation=tf.nn.relu, name="value")
 
         # split and combine multihead --- output dimension [h*N, timestep,  C/h]
         _Q = tf.concat(tf.split(Q, num_heads, axis=-1), axis=0)
